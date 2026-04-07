@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Claw Agent Stdio Test</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      background: #0f172a;
+      color: #e2e8f0;
+    }
+    .wrap {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    h1 {
+      font-size: 20px;
+      margin: 0 0 12px;
+    }
+    .hint {
+      color: #93c5fd;
+      margin-bottom: 12px;
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    input, button, textarea, select {
+      font: inherit;
+    }
+    input[type="text"] {
+      flex: 1;
+      padding: 10px;
+      border: 1px solid #334155;
+      background: #111827;
+      color: #e2e8f0;
+      border-radius: 8px;
+    }
+    button {
+      padding: 10px 14px;
+      border: 1px solid #334155;
+      background: #1e293b;
+      color: #e2e8f0;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    button:hover {
+      background: #334155;
+    }
+    #log {
+      width: 100%;
+      height: 70vh;
+      border: 1px solid #334155;
+      background: #020617;
+      color: #e2e8f0;
+      border-radius: 8px;
+      padding: 10px;
+      box-sizing: border-box;
+      white-space: pre;
+      overflow: auto;
+    }
+    .small {
+      color: #94a3b8;
+      font-size: 12px;
+      margin-top: 10px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Claw Agent Stdio Test</h1>
+    <div class="hint">First message will trigger backend to start <code>claw agent serve --stdio</code>.</div>
+    <div class="row">
+      <input id="prompt" type="text" placeholder="Type prompt and press Send..." />
+      <button id="sendBtn">Send</button>
+      <button id="shutdownBtn">Shutdown</button>
+    </div>
+    <textarea id="log" readonly></textarea>
+    <div class="small">WebSocket: <span id="wsAddr"></span></div>
+  </div>
+
+  <script>
+    const logEl = document.getElementById('log');
+    const promptEl = document.getElementById('prompt');
+    const sendBtn = document.getElementById('sendBtn');
+    const shutdownBtn = document.getElementById('shutdownBtn');
+    const wsAddrEl = document.getElementById('wsAddr');
+
+    const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const wsUrl = `${wsProto}://${location.host}/ws`;
+    wsAddrEl.textContent = wsUrl;
+
+    const ws = new WebSocket(wsUrl);
+    let lastRequestId = null;
+    let pendingPermissions = [];
+
+    function appendLog(line) {
+      const ts = new Date().toISOString();
+      logEl.value += `[${ts}] ${line}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    ws.addEventListener('open', () => appendLog('WS connected'));
+    ws.addEventListener('close', () => appendLog('WS closed'));
+    ws.addEventListener('error', () => appendLog('WS error'));
+
+    ws.addEventListener('message', (evt) => {
+      let msg;
+      try {
+        msg = JSON.parse(evt.data);
+      } catch {
+        appendLog(`RAW: ${evt.data}`);
+        return;
+      }
+
+      if (msg.type === 'turn_sent') {
+        lastRequestId = msg.requestId;
+      }
+
+      if (msg.type === 'agent_event' && msg.event && msg.event.type === 'permission_request') {
+        pendingPermissions.push(msg.event);
+      }
+
+      appendLog(JSON.stringify(msg, null, 2));
+    });
+
+    function sendUserInput() {
+      const text = promptEl.value.trim();
+      if (!text) return;
+      ws.send(JSON.stringify({ type: 'user_input', text }));
+      promptEl.value = '';
+    }
+
+    sendBtn.addEventListener('click', sendUserInput);
+    promptEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') sendUserInput();
+    });
+
+    shutdownBtn.addEventListener('click', () => {
+      ws.send(JSON.stringify({ type: 'shutdown' }));
+    });
+
+    // Optional helpers from browser console:
+    // allowLastPermission()
+    // denyLastPermission()
+    window.allowLastPermission = function allowLastPermission() {
+      const req = pendingPermissions.pop();
+      if (!req) return appendLog('No pending permission request');
+      ws.send(JSON.stringify({
+        type: 'permission_decision',
+        requestId: req.requestId,
+        permissionId: req.permissionId,
+        decision: 'allow',
+      }));
+    };
+
+    window.denyLastPermission = function denyLastPermission() {
+      const req = pendingPermissions.pop();
+      if (!req) return appendLog('No pending permission request');
+      ws.send(JSON.stringify({
+        type: 'permission_decision',
+        requestId: req.requestId,
+        permissionId: req.permissionId,
+        decision: 'deny',
+      }));
+    };
+  </script>
+</body>
+</html>

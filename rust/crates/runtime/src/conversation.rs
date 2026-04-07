@@ -508,6 +508,10 @@ where
         &mut self.session
     }
 
+    pub fn api_client_mut(&mut self) -> &mut C {
+        &mut self.api_client
+    }
+
     #[must_use]
     pub fn fork_session(&self, branch_name: Option<String>) -> Session {
         self.session.fork(branch_name)

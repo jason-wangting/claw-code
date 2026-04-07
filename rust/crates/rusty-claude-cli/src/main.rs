@@ -13,7 +13,7 @@ mod render;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -27,7 +27,8 @@ use api::{
     detect_provider_kind, oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient,
     AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
     MessageResponse, OutputContentBlock, PromptCache, ProviderKind, StreamEvent as ApiStreamEvent,
-    ToolChoice, ToolDefinition, ToolResultContentBlock,
+    ToolChoice, ToolDefinition, ToolResultContentBlock, ProviderClient, OpenAiCompatClient,
+    OpenAiCompatConfig,
 };
 
 use commands::{
@@ -217,6 +218,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_path,
             output_format,
         } => run_export(&session_reference, output_path.as_deref(), output_format)?,
+        CliAction::AgentServeStdio => run_agent_serve_stdio()?,
         CliAction::Repl {
             model,
             allowed_tools,
@@ -301,6 +303,7 @@ enum CliAction {
         output_path: Option<PathBuf>,
         output_format: CliOutputFormat,
     },
+    AgentServeStdio,
     Repl {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
@@ -537,6 +540,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "logout" => Ok(CliAction::Logout { output_format }),
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
+        "agent" => parse_agent_args(&rest[1..]),
         "prompt" => {
             let prompt = rest[1..].join(" ");
             if prompt.trim().is_empty() {
@@ -1068,6 +1072,16 @@ fn parse_export_args(
     })
 }
 
+fn parse_agent_args(args: &[String]) -> Result<CliAction, String> {
+    if args.len() == 2 && args[0] == "serve" && args[1] == "--stdio" {
+        return Ok(CliAction::AgentServeStdio);
+    }
+    if args.len() == 1 && args[0] == "serve" {
+        return Err("agent serve currently requires --stdio".to_string());
+    }
+    Err("usage: claw agent serve --stdio".to_string())
+}
+
 fn parse_resume_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
     let (session_path, command_tokens): (PathBuf, &[String]) = match args.first() {
         None => (PathBuf::from(LATEST_SESSION_REFERENCE), &[]),
@@ -1314,6 +1328,206 @@ fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     if report.has_failures() {
         return Err("doctor found failing checks".into());
     }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AgentServeInboundEvent {
+    StartSession {
+        #[serde(rename = "sessionId")]
+        session_id: Option<String>,
+        cwd: Option<PathBuf>,
+        model: Option<String>,
+        #[serde(rename = "permissionMode")]
+        permission_mode: Option<String>,
+    },
+    Turn {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        input: String,
+    },
+    PermissionDecision {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "permissionId")]
+        permission_id: String,
+        decision: String,
+    },
+    Cancel {
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
+    Shutdown,
+}
+
+fn emit_agent_event(value: Value) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", serde_json::to_string(&value)?);
+    io::stdout().flush()?;
+    Ok(())
+}
+
+fn emit_agent_error(
+    request_id: Option<&str>,
+    code: &str,
+    message: impl Into<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    emit_agent_event(json!({
+        "type": "error",
+        "requestId": request_id,
+        "code": code,
+        "message": message.into(),
+    }))
+}
+
+fn run_agent_serve_stdio() -> Result<(), Box<dyn std::error::Error>> {
+    let stdin = io::stdin();
+    let mut reader = io::BufReader::new(stdin.lock());
+    let mut line = String::new();
+    let mut live_cli: Option<LiveCli> = None;
+    let mut model = DEFAULT_MODEL.to_string();
+    let mut permission_mode = default_permission_mode();
+
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            break;
+        }
+        let raw = line.trim();
+        if raw.is_empty() {
+            continue;
+        }
+
+        let event = match serde_json::from_str::<AgentServeInboundEvent>(raw) {
+            Ok(event) => event,
+            Err(error) => {
+                emit_agent_error(None, "INVALID_EVENT", format!("invalid JSON event: {error}"))?;
+                continue;
+            }
+        };
+
+        match event {
+            AgentServeInboundEvent::StartSession {
+                session_id,
+                cwd,
+                model: requested_model,
+                permission_mode: requested_permission_mode,
+            } => {
+                if let Some(cwd) = cwd {
+                    if let Err(error) = env::set_current_dir(&cwd) {
+                        emit_agent_error(
+                            None,
+                            "INVALID_CWD",
+                            format!("failed to switch cwd to {}: {error}", cwd.display()),
+                        )?;
+                        continue;
+                    }
+                }
+                if let Some(requested_model) = requested_model {
+                    model = requested_model;
+                }
+                if let Some(requested_permission_mode) = requested_permission_mode {
+                    match parse_permission_mode_arg(&requested_permission_mode) {
+                        Ok(mode) => permission_mode = mode,
+                        Err(error) => {
+                            emit_agent_error(None, "INVALID_PERMISSION_MODE", error)?;
+                            continue;
+                        }
+                    }
+                }
+
+                live_cli = match LiveCli::new(model.clone(), true, None, permission_mode) {
+                    Ok(cli) => Some(cli),
+                    Err(error) => {
+                        emit_agent_error(
+                            None,
+                            "SESSION_START_FAILED",
+                            format!("failed to initialize session: {error}"),
+                        )?;
+                        continue;
+                    }
+                };
+
+                let active_session_id = live_cli
+                    .as_ref()
+                    .map(|cli| cli.session.id.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                emit_agent_event(json!({
+                    "type": "ready",
+                    "protocolVersion": "0",
+                    "sessionId": active_session_id,
+                    "requestedSessionId": session_id,
+                    "model": model,
+                    "permissionMode": permission_mode.as_str(),
+                }))?;
+            }
+            AgentServeInboundEvent::Turn { request_id, input } => {
+                if live_cli.is_none() {
+                    live_cli = Some(LiveCli::new(model.clone(), true, None, permission_mode)?);
+                    let active_session_id = live_cli
+                        .as_ref()
+                        .map(|cli| cli.session.id.clone())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    emit_agent_event(json!({
+                        "type": "ready",
+                        "protocolVersion": "0",
+                        "sessionId": active_session_id,
+                        "model": model,
+                        "permissionMode": permission_mode.as_str(),
+                    }))?;
+                }
+
+                let Some(cli) = live_cli.as_mut() else {
+                    emit_agent_error(Some(&request_id), "SESSION_NOT_READY", "session unavailable")?;
+                    continue;
+                };
+                match cli.run_turn_summary_for_server(&request_id, &input) {
+                    Ok(summary) => {
+                        emit_agent_event(json!({
+                            "type": "final",
+                            "requestId": request_id,
+                            "text": final_assistant_text(&summary),
+                            "usage": {
+                                "input_tokens": summary.usage.input_tokens,
+                                "output_tokens": summary.usage.output_tokens,
+                                "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
+                                "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
+                            },
+                            "iterations": summary.iterations,
+                            "toolUses": collect_tool_uses(&summary),
+                            "toolResults": collect_tool_results(&summary),
+                        }))?;
+                    }
+                    Err(error) => {
+                        emit_agent_error(Some(&request_id), "TURN_FAILED", error.to_string())?;
+                    }
+                }
+            }
+            AgentServeInboundEvent::PermissionDecision {
+                request_id,
+                permission_id,
+                decision,
+            } => {
+                let _ = permission_id;
+                let _ = decision;
+                emit_agent_error(
+                    Some(&request_id),
+                    "UNSUPPORTED_EVENT",
+                    "permission_decision is not implemented yet in serve mode",
+                )?;
+            }
+            AgentServeInboundEvent::Cancel { request_id } => {
+                emit_agent_error(
+                    Some(&request_id),
+                    "UNSUPPORTED_EVENT",
+                    "cancel is not implemented yet in serve mode",
+                )?;
+            }
+            AgentServeInboundEvent::Shutdown => break,
+        }
+    }
+
     Ok(())
 }
 
@@ -3485,6 +3699,24 @@ impl LiveCli {
             })
         );
         Ok(())
+    }
+
+    fn run_turn_summary_for_server(
+        &mut self,
+        request_id: &str,
+        input: &str,
+    ) -> Result<runtime::TurnSummary, Box<dyn std::error::Error>> {
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        runtime
+            .api_client_mut()
+            .set_server_stream_request_id(Some(request_id.to_string()));
+        let result = runtime.run_turn(input, None);
+        runtime.api_client_mut().set_server_stream_request_id(None);
+        hook_abort_monitor.stop();
+        let summary = result?;
+        self.replace_runtime(runtime)?;
+        self.persist_session()?;
+        Ok(summary)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -6265,7 +6497,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: AnthropicClient,
+    client: ProviderClient,
     session_id: String,
     model: String,
     enable_tools: bool,
@@ -6273,6 +6505,7 @@ struct AnthropicRuntimeClient {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    server_stream_request_id: Option<String>,
 }
 
 impl AnthropicRuntimeClient {
@@ -6285,11 +6518,23 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let resolved_model = api::resolve_model_alias(&model);
+        // OpenRouter-style slugs (for example `openai/gpt-4.1-mini`) should
+        // always use the OpenAI-compatible provider path.
+        let force_openai_compat = resolved_model.contains('/');
+        let client = if force_openai_compat {
+            ProviderClient::OpenAi(OpenAiCompatClient::from_env(OpenAiCompatConfig::openai())?)
+                .with_prompt_cache(PromptCache::new(session_id))
+        } else {
+            ProviderClient::from_model_with_anthropic_auth(
+                &model,
+                Some(resolve_cli_auth_source()?),
+            )?
+            .with_prompt_cache(PromptCache::new(session_id))
+        };
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url())
-                .with_prompt_cache(PromptCache::new(session_id)),
+            client,
             session_id: session_id.to_string(),
             model,
             enable_tools,
@@ -6297,7 +6542,12 @@ impl AnthropicRuntimeClient {
             allowed_tools,
             tool_registry,
             progress_reporter,
+            server_stream_request_id: None,
         })
+    }
+
+    fn set_server_stream_request_id(&mut self, request_id: Option<String>) {
+        self.server_stream_request_id = request_id;
     }
 }
 
@@ -6384,13 +6634,13 @@ impl AnthropicRuntimeClient {
         message_request: &MessageRequest,
         apply_stall_timeout: bool,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let mut stream =
-            self.client
-                .stream_message(message_request)
-                .await
-                .map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                })?;
+        let mut stream = self
+            .client
+            .stream_message(message_request)
+            .await
+            .map_err(|error| {
+                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+            })?;
         let mut stdout = io::stdout();
         let mut sink = io::sink();
         let out: &mut dyn Write = if self.emit_output {
@@ -6458,6 +6708,17 @@ impl AnthropicRuntimeClient {
                 ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                     ContentBlockDelta::TextDelta { text } => {
                         if !text.is_empty() {
+                            if let Some(request_id) = &self.server_stream_request_id {
+                                let payload = json!({
+                                    "type": "delta",
+                                    "requestId": request_id,
+                                    "text": text,
+                                });
+                                println!("{}", payload);
+                                io::stdout()
+                                    .flush()
+                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            }
                             if let Some(progress_reporter) = &self.progress_reporter {
                                 progress_reporter.mark_text_phase(&text);
                             }
@@ -7314,7 +7575,7 @@ fn response_to_events(
     Ok(events)
 }
 
-fn push_prompt_cache_record(client: &AnthropicClient, events: &mut Vec<AssistantEvent>) {
+fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
     if let Some(record) = client.take_last_prompt_cache_record() {
         if let Some(event) = prompt_cache_record_to_runtime_event(record) {
             events.push(AssistantEvent::PromptCache(event));
@@ -7568,6 +7829,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw agents")?;
     writeln!(out, "  claw mcp")?;
     writeln!(out, "  claw skills")?;
+    writeln!(out, "  claw agent serve --stdio")?;
+    writeln!(
+        out,
+        "      Start machine-oriented JSONL conversation server over stdio"
+    )?;
     writeln!(out, "  claw system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
     writeln!(out, "  claw login")?;
     writeln!(out, "  claw logout")?;
@@ -8599,6 +8865,22 @@ mod tests {
                 output_format: CliOutputFormat::Text,
             }
         );
+        assert_eq!(
+            parse_args(&[
+                "agent".to_string(),
+                "serve".to_string(),
+                "--stdio".to_string()
+            ])
+            .expect("agent serve should parse"),
+            CliAction::AgentServeStdio
+        );
+    }
+
+    #[test]
+    fn rejects_agent_serve_without_stdio() {
+        let error = parse_args(&["agent".to_string(), "serve".to_string()])
+            .expect_err("agent serve without stdio should fail");
+        assert!(error.contains("requires --stdio"));
     }
 
     #[test]
