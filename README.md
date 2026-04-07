@@ -52,6 +52,13 @@ cargo build --workspace
 ./target/debug/claw prompt "summarize this repository"
 ```
 
+Build and link `claw` for global use:
+
+```bash
+./install-global.sh
+claw --version
+```
+
 Authenticate with either an API key or the built-in OAuth flow:
 
 ```bash
