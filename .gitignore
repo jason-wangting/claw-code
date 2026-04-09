@@ -8,3 +8,5 @@ archive/
 agent-serve-stdio-test/__pycache__/
 agent-serve-stdio-test/.venv/
 .DS_Store
+
+.claw/sessions/
